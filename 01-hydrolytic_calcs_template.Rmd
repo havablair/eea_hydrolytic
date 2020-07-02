@@ -1,0 +1,558 @@
+---
+title: "Hydrolytic Extracellular Enzyme Activity Calculations"
+author: "Hava Blair"
+date: "June 25, 2020"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+  html_document: default
+---
+
+```{r setup, echo = FALSE, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+## Load Packages 
+library(tidyverse)
+library(plater)
+library(glue)
+library(broom)
+library(hms)
+
+```
+
+\newpage
+# Setup
+
+## Templates
+Start by filling out your template files and metadata file.
+
+You need one completed **template file** for each plate, in CSV format. There is a template in the project folder.  There are templates for both **Plate A** and **Plate B** with plate layouts pre-filled for you (check to make sure they match what you did!).  The template is in the project folder, file name is "template_plate_a_hydrolytic.csv" for A plates and "template_plate_b_hydrolytic.csv"
+
+You also need one completed **metadata file** (data for all plates you are analyzing with this script can be included in the same file).  The template is in the project folder, file name "template_metadata.csv"
+
+Name your template files with the ID of your plate.  This will be added as its own column by plater so that you can identify which plate the data is coming from. 
+
+Files used with this version of the script should contain the following four blocks of information:
+
+  --"template" = standard, blank, and sample IDs.  Empty wells (no sample, standard, or check) may be coded as ".", "0" (zero), "NA", or left blank.
+  
+  --"data" = raw fluorescence data from the plate reader
+  
+  --"bad_wells" = identifies any wells that have known problems (ex. pipetting errors).  May be coded as "bad", "Bad", "x", or "X".  Anything with NA (blank) will be kept as "good"
+  
+  -- "conc_uM" = identifies the concentration of the substrate or MUB used in the well.  The concentration should be in umol/L (uM).  Examples:  sub_300 = 300 uM enzyme substrate.  mub_1.25 = 1.25 uM MUB standard.  
+
+## File organization 
+
+The files you want to process must all be in the **filled-templates subfolder**, and that folder must not contain any other files. R will attempt to read in all files in the designated folder.
+
+Now you are ready to read in your files. If you get an error, check whether you have any extra CSV files in the designated folder.
+
+## Read in plate templates & metadata 
+
+```{r files, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+#read in completed template files from subfolder
+file.names <- dir("./filled-templates/")
+file.paths<- paste0("./filled-templates/", file.names)
+plates <- read_plates(file.paths)
+colnames(plates) <- c("plate", "wells", "id", "fluor", "bad_wells", "conc_uM")
+unique(plates$plate) # To check that all plates read in correctly
+
+#read in plate metadata
+plate_metadata <- read.csv("./eea_metadata_mgtest.csv", stringsAsFactors = FALSE)
+
+colnames(plate_metadata) <- c("plate", "ph_buffer", "moist_soil_mass_g",  "vol_buffer_ml", "substrates", "tin", "tin_moist", "tin_dry", "time_soil_added", "time_naoh_added", "time_plate_read")
+```
+
+
+# Metadata calculations 
+
+## Incubation time, soil oven dry equivalent
+
+```{r metadata-calcs, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+#parse the time columns so we can do math on them
+plate_metadata <- plate_metadata %>% 
+  mutate(time_soil_added = parse_hm(time_soil_added), 
+         time_naoh_added = parse_hm(time_naoh_added), 
+         time_plate_read = parse_hm(time_plate_read))
+
+# calculate incubation time and convert from seconds to hours
+plate_metadata <- plate_metadata %>% 
+  mutate(inc_time_hr = as.numeric(((time_plate_read - time_soil_added)/60/60)))
+
+#calculate soil moisture content and dry soil equivalent
+plate_metadata <- plate_metadata %>% 
+  mutate(mc_soil_moist = tin_moist - tin,
+         mc_soil_dry = tin_dry - tin,
+         soil_water_content = (mc_soil_moist-mc_soil_dry)/mc_soil_dry,
+         soil_ov_dry_eq_g = moist_soil_mass_g - (moist_soil_mass_g * soil_water_content))
+
+```
+
+# Initial Quality control 
+
+## Remove empty wells and known bad wells
+
+```{r bad-wells, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+
+#Remove empty wells
+no_missing <- subset(plates, !is.na(id) & id != 0 & id != ".")
+
+# Remove bad wells
+no_bad <- subset(no_missing, is.na(bad_wells))
+
+#Create a dataframe with the details about which wells were removed as "bad".  Can write this to CSV now, or wait until after later QC checks to compile a list of samples that need to be redone.
+bad_list <- subset(no_missing, !is.na(bad_wells))
+
+#print a message about how many wells were removed
+wells_removed <- nrow(plates) - nrow(no_bad)
+
+glue("Removed {wells_removed} wells that were missing or bad")
+
+# filter out plate b here - it will be used for the emission coefficient calculation
+plate_b <- no_bad %>% 
+  filter(plate == "plate_b")
+
+#clean_data contains all of the plate a data 
+clean_data <- no_bad %>% 
+  filter(plate != "plate_b")
+
+#nest data so we can keep our calculations organized nicely by plate
+clean_nested <- clean_data %>% 
+  group_by(plate) %>% 
+  nest()
+
+```
+# Standards calculations
+
+## B Plate: MUB standard calculations (for emission coefficient calculation)
+
+```{r mub-std-calcs, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+
+#exract MUB concentrations from the conc_uM column and drop the empty "bad_wells" column
+plate_b <- plate_b %>% 
+  mutate(conc_uM = as.numeric(str_replace(conc_uM, "mub_", ""))) %>% 
+  select(-bad_wells)
+
+#calculate the mean fluorescence across technical replicates for each MUB concentration
+plate_b_means <- plate_b %>%
+  group_by(id) %>% 
+  filter(str_detect(id, "MUB")) %>% 
+  summarise(mub_std_fluor = mean(fluor), n = n(), sd = sd(fluor), cv = sd(fluor)/mean(fluor)*100)
+
+#calculate the plate blank (buffer only)
+plate_b_blank <- plate_b %>%
+  filter(str_detect(id, "Buf")) %>% 
+  summarise(fluor_blank = mean(fluor), n = n())
+
+fluor_blank <- plate_b_blank$fluor_blank
+
+#subtract the fluorescence of the plate blank (id = Buf) from the mean fluorescence of the standards
+plate_b_means <- plate_b_means %>% 
+  mutate(plate_blank = fluor_blank, 
+         corr_fluor = mub_std_fluor - plate_blank, 
+         mub_conc_uM = as.numeric(str_replace(id, "MUB", "")))
+
+plate_b_means
+
+```
+
+
+## A Plates: Calculate plate blank and homogenate blank 
+
+```{r blank-calcs, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+
+#function to calculate plate blanks (Buffer only)
+get_plate_blank <- function(data){
+  buf <- data %>% 
+    filter(id == "Buf")
+    mean(buf$fluor)
+}
+
+#apply function to nested df
+with_a_blanks <- clean_nested %>% 
+  mutate(plate_blank = map_dbl(data, get_plate_blank))
+
+#function to calculate the fluor for HOMogenate BLanks (hombl = buffer + homogenate)
+get_hombl <- function(data){
+  buf_soil <- data %>% 
+    filter(str_detect(id, "Hombl"))
+    mean(buf_soil$fluor)
+}
+
+#apply function to nested df
+calc_hombl <- with_a_blanks %>% 
+  mutate(hombl = map_dbl(data, get_hombl))
+
+head(calc_hombl)
+
+```
+## A Plates:  Calculate mean fluor of the MUB standard + soil wells (for quench coeff calculation)
+
+```{r fluor-mub-soil, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+#function to average the MUB+soil (quench) standard wells to get mean fluorescence for each MUB concentration
+
+quench_std_fun <- function(data, hombl){
+  data %>%
+    select(wells, id, fluor, conc_uM) %>% 
+    filter(str_detect(id, "quench")) %>% 
+    mutate(conc_uM = as.numeric(str_replace(conc_uM, "mub_", ""))) %>%
+    group_by(conc_uM) %>% 
+    summarise(quench_fluor = mean(fluor), n = n(), sd = sd(fluor), cv = sd(fluor)/mean(fluor)*100, hombl = hombl, corr_fluor = quench_fluor - hombl)  #also corrects for hom blank here
+}
+
+#apply function to nested df
+quench_nested <- calc_hombl %>% 
+  mutate(quench_std_values = map2(data, hombl, quench_std_fun))
+
+head(quench_nested)
+```
+# Linear models
+
+## Linear model functions 
+
+```{r lm-fun, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+
+#function to run a linear model x = MUB concentration, y = mean fluorescence
+
+lm_mod_ftn <- function(df){
+  lm(corr_fluor ~ conc_uM, data = df)
+}
+
+# functions to extract linear model details calculated above into a nicer format for putting in our graphs
+
+b_fun <- function(mod){
+  coefficients(mod)[[1]]
+}
+
+slope_fun <- function(mod){
+  coefficients(mod)[[2]]
+}
+
+r_sq_fun <- function(mod){
+  summary(mod)[["r.squared"]]
+}
+
+#leaving this max fluorescence function out for now because I'm not sure we need it.  
+# max_fluor_fun <- function(data){
+#   max(data$corr_std_mean)
+# }
+
+
+```
+
+## A Plates: Linear model calcs for quench std curves
+
+```{r a-lm-calcs, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+#calculate linear model for quench (A plates)
+
+quench_lm_calcs <- quench_nested %>% 
+  mutate(quench_lm = map(quench_std_values, lm_mod_ftn))
+
+#Extract linear models details from the homogenate control linear model
+quench_lm_details <- quench_lm_calcs %>% 
+  mutate(intcpt_quench = map_dbl(quench_lm, b_fun), slope_quench = map_dbl(quench_lm, slope_fun), r_squared_quench = map_dbl(quench_lm, r_sq_fun))
+
+#nest the linear model details in a dataframe
+nest_quench_stats <- quench_lm_details %>% 
+  nest(lm_stats_quench = c(intcpt_quench, slope_quench, r_squared_quench))
+
+quench_lm_details %>% 
+  select(plate, intcpt_quench, slope_quench, r_squared_quench)
+
+```
+## B Plate: Linear model calculations (emission)
+```{r b-lm-calcs, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+#fix name of mub concentration column so it works with the lm function
+plate_b_rename <- plate_b_means %>% 
+  rename(conc_uM = mub_conc_uM)
+
+#apply linear model ftn to plate b data
+lm_plate_b <- lm_mod_ftn(plate_b_rename) 
+
+#save linear model details
+intcpt_emis <- b_fun(lm_plate_b)
+slope_emis <- slope_fun(lm_plate_b)
+rsq_emis <- r_sq_fun(lm_plate_b)
+
+#add linear model details to plate b dataframe
+lm_stats_emis <- plate_b_rename %>% 
+  mutate(intcpt_emis = intcpt_emis, slope_emis = slope_emis, rsq_emis = rsq_emis)
+
+head(lm_stats_emis)
+
+```
+# Standard curve graphs 
+
+## B Plate: Plot standard curve (emission)
+
+```{r emis-std-curve, tidy=TRUE, tidy.opts=list(width.cutoff=60), fig.height=4, fig.width=5}
+## consider writing this into a function so that multiple B plates (from multiple runs) could be processed together.  
+
+  b_plot <- ggplot(lm_stats_emis) + 
+    geom_point(aes(x = conc_uM, y = corr_fluor)) + 
+    geom_abline(aes(slope = slope_emis, intercept = intcpt_emis)) +
+    geom_text(data = lm_stats_emis, aes(x = 1.0, y = 20000, label = paste("R^2=", round(rsq_emis, digits = 3))), inherit.aes = FALSE) +
+    geom_text(aes(x = 1.0, y = 17000, label = paste(" y= ", round(slope_emis, digits = 2), "x", " + ", round(intcpt_emis, digits = 2))), inherit.aes = FALSE) + 
+    labs(title = glue("Plate B (emission) standard curve: MUB conc vs. fluorescence"))
+
+b_plot
+
+```
+
+
+
+## A Plate: plot quench standard curves
+
+```{r emission-coefficient, fig.height=4, fig.width=6, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+
+# plotting function
+plot_homog_fun <- function(quench_std_values, lm_stats_quench, plate){
+ 
+   g <- ggplot() + 
+  geom_point(data = quench_std_values, aes(x = conc_uM, y = corr_fluor)) + 
+    geom_abline(data = lm_stats_quench, aes(slope = slope_quench, intercept = intcpt_quench)) +
+    geom_text(data = lm_stats_quench, aes(x = 1.0, y = 1000, label = paste("R^2=", round(r_squared_quench, digits = 4))), inherit.aes = FALSE) +
+    geom_text(data = lm_stats_quench, aes(x = 1.0, y = 1500, label = paste(" y= ", round(slope_quench, digits = 2), "x", " + ", round(intcpt_quench, digits = 2))), inherit.aes = FALSE) + 
+    labs(title = glue("{plate} regression of fluor vs. MUB concentration w/soil"))
+  return(g)
+}
+
+# run the plotting function for each plate and store the plots in our nested dataframe
+homog_plots <- nest_quench_stats %>% 
+  mutate(plot_homog_control = pmap(list(quench_std_values, lm_stats_quench, plate), plot_homog_fun))
+
+homog_plots$plot_homog_control
+
+```
+
+# Coefficient calculations 
+
+## Calculate emission coefficient
+
+The emission coefficient is the slope (m) from plate b (fluorescence vs MUB conc NO SOIL) divided by the assay volume 
+
+Pay attention to units! 
+**slope (m) units** from the standard curves = fluor/uM = fluor/ (umol/L) = fluor L / umol = fluor mL / nmol
+
+**assay volume units** are 250uL = 0.00025 L = 0.250 mL 
+
+**emission coefficient** units are fluorescence/nmol. 
+
+```{r emis-coefficient, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+assay_vol_ml <- 0.250
+
+# just grabbing the first element of slope_emis because the slope is the same for all 4 rows in this df ( we only have 1 B plate). In future consider writing a function that will return this for multiple B plates 
+
+slope_emis <- lm_stats_emis$slope_emis[1]
+
+# calculate slope of the emission curve and the emisson coefficient
+emis_calc <- homog_plots %>% 
+  mutate(slope_emis = slope_emis[1],
+         emis_coeff = slope_emis/assay_vol_ml)
+
+```
+
+## Calculate the quench coefficient 
+
+The quench coefficient is calculated as the slope of the quench (MUB + soil) standard curve divided by the slope of the emission (MUB) standard curve.
+
+**Add more information about what the quench coefficient actually is...** 
+
+```{r quench-coefficient, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+
+coeff_calcs <- emis_calc %>% 
+  mutate(quench_coeff = map2_dbl(lm_stats_quench, slope_emis, ~ as.numeric(.x[["slope_quench"]])/.y))
+
+
+```
+# Assay well calculations 
+
+## A Plates: Mean of technical reps for assay & substrate control wells
+
+```{r assay-sub-reps, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+
+# Calculate the mean fluor for the assay wells & substrate control wells (note using the un-nested dataframe here)
+
+assay_sub_blnks <- clean_data %>% 
+  filter(str_detect(id, "assay") | str_detect(id, "sub-blank")) %>% 
+  group_by(plate, id) %>% 
+  summarise(fluor_mean = mean(fluor), n = n(), sd = sd(fluor, na.rm = T), cv = sd(fluor, na.rm = T)/mean(fluor)*100)
+
+# format dataframe "wide" so that substrate controls are in columns adjacent to assay wells for each enzyme
+wide <- assay_sub_blnks %>% 
+  pivot_wider(id_cols = c(plate, id), names_from = id, values_from = fluor_mean, names_prefix = "mean_fluor_", names_sep = "_")
+
+# grab relevant coeffs from nested dataframe
+coeffs <- coeff_calcs %>% 
+  select(plate, plate_blank, hombl, emis_coeff, quench_coeff)
+
+# join coeffs to assay/substrate well calculations 
+wide_all <- left_join(wide, coeffs, by = "plate")
+
+```
+## Calculate net fluorescence 
+
+Net fluorescence = ((assay-homogenate control) / quench coefficient) - (substrate control-plate blank)
+
+```{r net-fluor-calc, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+
+#net fluorescence calculation for each enzyme
+net_fluor_calcs <- wide_all %>%
+  
+  mutate(BG_net_fluor = (((`mean_fluor_BG-assay` - hombl)/quench_coeff)-(`mean_fluor_BG-sub-blank` - plate_blank)), 
+         Cello_net_fluor = (((`mean_fluor_Cello-assay` - hombl)/quench_coeff)-(`mean_fluor_Cello-sub-blank` - plate_blank)),  
+         NAG_net_fluor = (((`mean_fluor_NAG-assay` - hombl)/quench_coeff)-(`mean_fluor_NAG-sub-blank` - plate_blank)),
+         P_net_fluor = (((`mean_fluor_P-assay` - hombl)/quench_coeff)-(`mean_fluor_P-sub-blank` - plate_blank)))
+
+```
+## Calculate enzyme activity
+
+Activity(nmol/g^-1 h^-1) = [Net fluor x buffer vol (mL)] / [emis coeff x homogenate vol(mL) x time(h) x ode soil mass mass(g)]
+
+Activity units are nmol / g^-1 hr^-1
+
+```{r activity-calc, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+
+#buffer vol is the volume of buffer used to make the soil slurries. In the regular Gutknecht lab protocol, this is 50 mL
+buffer_vol_ml <- 50
+
+#vol of homogenate added to the assay wells in mL 
+homogenate_vol_ml <- 0.200 
+
+#bring in plate metadata (incubation time, ov dry soil eq, etc)
+calcs_with_meta <- left_join(net_fluor_calcs, plate_metadata, by = "plate")
+
+#activity calculation for each enzyme
+activity_calcs <- calcs_with_meta %>% 
+  mutate(BG_activity = (BG_net_fluor * buffer_vol_ml) / (emis_coeff * homogenate_vol_ml * inc_time_hr * soil_ov_dry_eq_g),
+         Cello_activity = (Cello_net_fluor * buffer_vol_ml) / (emis_coeff * homogenate_vol_ml * inc_time_hr * soil_ov_dry_eq_g),
+         NAG_activity = (NAG_net_fluor * buffer_vol_ml) / (emis_coeff * homogenate_vol_ml * inc_time_hr * soil_ov_dry_eq_g), 
+         P_activity = (P_net_fluor * buffer_vol_ml) / (emis_coeff * homogenate_vol_ml * inc_time_hr * soil_ov_dry_eq_g))
+
+
+```
+
+# Compare R vs. Excel results 
+
+I used the "HB_Hydrolygic enzyme calculation template_12 samples" in the Gutknecht shared drive to do the "Excel" calculations listed here. I had to a couple changes to the calculations so they aligned with my R script:
+
+**Emission coefficient**: In the Excel sheet, emission coefficient is calculated as the slope of the MUB standard curve.  German et al. 2011 specify that emission coefficient is this slope **divided by the assay volume**.  I changed the excel spreadsheet to account for this, and also removed the assay volume term from the **final activity calculation** so we weren't accounting for it twice.  The math would have worked out either way, but I wanted to be able to compare coefficients.
+
+
+```{r calc-compare, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+
+#results from R calculations
+script_test <- activity_calcs %>% 
+  select(plate, BG_activity, P_activity, NAG_activity, Cello_activity)
+
+# Load in test results from excel spreadsheet calcs
+test1 <- read.csv("./mg_files/excel_test1_mg.csv", stringsAsFactors = FALSE)
+colnames(test1) <- c("plate", "BG_activity", "P_activity", "NAG_activity", "Cello_activity")
+
+#create columns to specify data provenance
+test1$batch = "excel"
+script_test$batch = "r_script"
+
+#convert to dataframe
+test1 <- as.data.frame(test1)
+script_test <- as.data.frame(script_test)
+
+#merge calcs from excel & R script into one dataframe
+merge_test <- rbind(test1, script_test)
+
+# bar plots to compare calcs
+cello_plot <- ggplot() + 
+  geom_col(data = merge_test, aes(x = plate, y = Cello_activity, group = batch, fill = batch), position = "dodge") + 
+  coord_flip() + 
+  labs(title = "Cello activity")
+
+bg_plot <- ggplot() + 
+  geom_col(data = merge_test, aes(x = plate, y = BG_activity, group = batch, fill = batch), position = "dodge") + 
+  coord_flip() + 
+  labs(title = "BG activity")
+
+nag_plot <- ggplot() + 
+  geom_col(data = merge_test, aes(x = plate, y = NAG_activity, group = batch, fill = batch), position = "dodge") + 
+  coord_flip() + 
+  labs(title = "NAG activity")
+
+p_plot <- ggplot() + 
+  geom_col(data = merge_test, aes(x = plate, y = P_activity, group = batch, fill = batch), position = "dodge") + 
+  coord_flip() + 
+  labs(title = "P activity")
+
+cello_plot
+bg_plot
+nag_plot
+p_plot
+
+```
+
+# Visualizing variability 
+
+```{r variability}
+# to visualize variability on plate B (emission) 
+plate_b_means %>% 
+  ggplot() +
+  geom_histogram(aes(cv), bins = 20) +
+  labs(title = "CV for Standard Curve Plate B (no soil)")
+
+
+# quench std data 
+quench_var <- quench_nested %>% 
+  select(-hombl, -data, -plate_blank) %>% 
+  unnest(quench_std_values)
+
+# visualize quench data by plate
+(quench_var_plot <- quench_var %>% 
+  ggplot() + 
+  geom_histogram(aes(cv, fill = plate), bins = 20) + 
+  labs(title = "CV distribution quench standards") + 
+  facet_wrap(vars(plate)) + 
+  theme(legend.position = "none"))
+
+# visualize quench data overall
+(quench_var_plot <- quench_var %>% 
+  ggplot() + 
+  geom_histogram(aes(cv), bins = 20) + 
+  labs(title = "CV distribution quench standards") + 
+  theme(legend.position = "none"))
+
+# to visualize the assay well variability by plate
+(assay_var_plot <- assay_sub_blnks %>% 
+  filter(str_detect(id,"assay")) %>% 
+  ggplot() + 
+  geom_histogram(aes(cv, fill = plate), bins = 20) + 
+  labs(title = "CV distribution assay wells") +
+    facet_wrap(vars(plate)) + 
+    theme(legend.position = "none"))
+
+# assay well variabiilty overall
+(assay_var_plot <- assay_sub_blnks %>% 
+  filter(str_detect(id,"assay")) %>% 
+  ggplot() + 
+  geom_histogram(aes(cv), bins = 30) + 
+  labs(title = "CV distribution assay wells") +
+    theme(legend.position = "none"))
+
+# visualize the substrate blank variability by plate
+(subs_var_plot <- assay_sub_blnks %>% 
+  filter(str_detect(id,"blank")) %>% 
+  ggplot() + 
+  geom_histogram(aes(cv, fill = plate), bins = 20) + 
+  labs(title = "CV distribution substrate controls") +
+    facet_wrap(vars(plate)) + 
+    theme(legend.position = "none"))
+
+# visualzie substrate blank variability overall
+(subs_var_plot <- assay_sub_blnks %>% 
+  filter(str_detect(id,"blank")) %>% 
+  ggplot() + 
+  geom_histogram(aes(cv), bins = 10) + 
+  labs(title = "CV distribution substrate controls") +
+    theme(legend.position = "none"))
+
+```
+
