@@ -24,12 +24,10 @@ library(hms)
 \newpage
 # Setup
 
-## Templates
-Start by filling out your template files and metadata file.
+## Plate Templates
+Start by filling out your template files and metadata file.  
 
-You need one completed **template file** for each plate, in CSV format. There is a template in the project folder.  There are templates for both **Plate A** and **Plate B** with plate layouts pre-filled for you (check to make sure they match what you did!).  The template is in the project folder, file name is "template_plate_a_hydrolytic.csv" for A plates and "template_plate_b_hydrolytic.csv"
-
-You also need one completed **metadata file** (data for all plates you are analyzing with this script can be included in the same file).  The template is in the project folder, file name "template_metadata.csv"
+You need one completed **template file** for each plate, in CSV format.   There are some templates in the `empty-templates` sub-directory for hydrolytic and oxidative enzyme assays regularly performed in the Gutknecht lab.  **Alternatively** you can use a script that HB wrote to automate the creation of `plater` templates (see `plater-prep` project here: https://github.com/havablair/plater-prep)
 
 Name your template files with the ID of your plate.  This will be added as its own column by plater so that you can identify which plate the data is coming from. 
 
@@ -37,17 +35,25 @@ Files used with this version of the script should contain the following four blo
 
   --"template" = standard, blank, and sample IDs.  Empty wells (no sample, standard, or check) may be coded as ".", "0" (zero), "NA", or left blank.
   
-  --"data" = raw fluorescence data from the plate reader
-  
-  --"bad_wells" = identifies any wells that have known problems (ex. pipetting errors).  May be coded as "bad", "Bad", "x", or "X".  Anything with NA (blank) will be kept as "good"
+  --"bad_wells" = identifies any wells that have known problems (ex. pipetting errors).  Code these as "bad". Leave all other wells empty in this part of the template.
   
   -- "conc_uM" = identifies the concentration of the substrate or MUB used in the well.  The concentration should be in umol/L (uM).  Examples:  sub_300 = 300 uM enzyme substrate.  mub_1.25 = 1.25 uM MUB standard.  
+  
+  --"data" = raw fluorescence data from the plate reader
+  
+## Metadata
+
+You also need one completed **metadata file** (data for all plates you are analyzing with this script can be included in the same file).  Find  "template_metadata.csv" in the `empty-templates` sub-directory.  Make sure that the plate_id column **exactly matches** the names of your filled templates. 
+
+Use 24-hour clock time (https://en.wikipedia.org/wiki/24-hour_clock) to specify time in the metadata sheet.
 
 ## File organization 
 
-The files you want to process must all be in the **filled-templates subfolder**, and that folder must not contain any other files. R will attempt to read in all files in the designated folder.
+The plate templates you want to process must all be in the **filled-templates subfolder**, and that folder must not contain any other files. R will attempt to read in all files in the designated folder.
 
-Now you are ready to read in your files. If you get an error, check whether you have any extra CSV files in the designated folder.
+Your **metadata file** should be in the main project folder (eea-hydrolytic-template)
+
+Now you are ready to read in your files. If you get an error, check whether you have any extra CSV files in your filled-templates folder.  Also check to make sure the files are saved as CSV, not XLSX. (However, script can easily be adjusted to read XLSX).
 
 ## Read in plate templates & metadata 
 
@@ -59,8 +65,8 @@ plates <- read_plates(file.paths)
 colnames(plates) <- c("plate", "wells", "id", "fluor", "bad_wells", "conc_uM")
 unique(plates$plate) # To check that all plates read in correctly
 
-#read in plate metadata
-plate_metadata <- read.csv("./eea_metadata_mgtest.csv", stringsAsFactors = FALSE)
+#read in plate metadata - fill in the name of your metadata file
+plate_metadata <- read.csv("./eea_metadata_test.csv", stringsAsFactors = FALSE)
 
 colnames(plate_metadata) <- c("plate", "ph_buffer", "moist_soil_mass_g",  "vol_buffer_ml", "substrates", "tin", "tin_moist", "tin_dry", "time_soil_added", "time_naoh_added", "time_plate_read")
 ```
@@ -97,7 +103,7 @@ plate_metadata <- plate_metadata %>%
 ```{r bad-wells, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
 
 #Remove empty wells
-no_missing <- subset(plates, !is.na(id) & id != 0 & id != ".")
+no_missing <- subset(plates, !is.na(id) & id != "empty")
 
 # Remove bad wells
 no_bad <- subset(no_missing, is.na(bad_wells))
@@ -127,6 +133,14 @@ clean_nested <- clean_data %>%
 # Standards calculations
 
 ## B Plate: MUB standard calculations (for emission coefficient calculation)
+
+Boone, R.D., Grigal, D.F., Sollins, P., Ahrens, R.J., & Armstrong, D.E. (1999). "Soil Sampling, Preparation, Archiving, and Quality Control" in Eds. Robertson, G. P., Coleman, D. C., Sollins, P., & Bledsoe, C. S. Standard soil methods for long-term ecological research. Oxford University Press on Demand.  p 15-16
+
+CV = (standard deviation / mean) * 100 
+
+Sometimes called relative standard deviation (RSD) in QA/QC literature according to Boone et al. 1999.  
+
+"Laboratory replicates with RSD [CV] values </= 10% indicate that analyses are sufficiently precise"  Boone et al., 1999 p.16
 
 ```{r mub-std-calcs, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
 
@@ -242,7 +256,7 @@ r_sq_fun <- function(mod){
 
 ```
 
-## A Plates: Linear model calcs for quench std curves
+## A Plates: Linear model calcs for MUB+soil standards (quench)
 
 ```{r a-lm-calcs, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
 #calculate linear model for quench (A plates)
@@ -257,12 +271,26 @@ quench_lm_details <- quench_lm_calcs %>%
 #nest the linear model details in a dataframe
 nest_quench_stats <- quench_lm_details %>% 
   nest(lm_stats_quench = c(intcpt_quench, slope_quench, r_squared_quench))
+```
 
-quench_lm_details %>% 
-  select(plate, intcpt_quench, slope_quench, r_squared_quench)
+### R^2 values for MUB+Soil standards (A Plate)
+
+```{r std-qc1, echo=FALSE}
+# check if any of the standard curves have R^2 <0.99
+check_a_stds <- quench_lm_details %>% 
+  select(plate, intcpt_quench, slope_quench, r_squared_quench) %>% 
+  filter(r_squared_quench < 0.99)
+
+#Print a message with a list of plates that have R^2 < 0.99 
+print("The following plates have R^2 < 0.99 for MUB+soil standards, check graphs and raw data for outliers and consider re-running these plates/samples:") 
+
+glue("{check_a_stds$plate}")
+
+print("MUB+soil standards are located in columns 7 and 8 of A Plates")
 
 ```
-## B Plate: Linear model calculations (emission)
+
+## B Plate: Linear model calculations for MUB standards (emission)
 ```{r b-lm-calcs, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
 #fix name of mub concentration column so it works with the lm function
 plate_b_rename <- plate_b_means %>% 
@@ -279,13 +307,17 @@ rsq_emis <- r_sq_fun(lm_plate_b)
 #add linear model details to plate b dataframe
 lm_stats_emis <- plate_b_rename %>% 
   mutate(intcpt_emis = intcpt_emis, slope_emis = slope_emis, rsq_emis = rsq_emis)
+```
 
-head(lm_stats_emis)
+### R^2 values for MUB standard curve (B Plate)
+```{r std-qc2, echo=FALSE}
+#print message with R^2 value of the B plate standard curve (emission)
+glue("The R^2 value for the linear model of the MUB standard curve is {round(lm_stats_emis$rsq_emis[1], 4)}, if this value is <0.99, review graphs below and check raw data for outliers.  Raw data for MUB standard curve can be found in the B plate columns 1 & 2")
 
 ```
 # Standard curve graphs 
 
-## B Plate: Plot standard curve (emission)
+## B Plate: Plot MUB standard curve (emission)
 
 ```{r emis-std-curve, tidy=TRUE, tidy.opts=list(width.cutoff=60), fig.height=4, fig.width=5}
 ## consider writing this into a function so that multiple B plates (from multiple runs) could be processed together.  
@@ -303,7 +335,7 @@ b_plot
 
 
 
-## A Plate: plot quench standard curves
+## A Plate: plot homogenate + MUB standard curves (quench)
 
 ```{r emission-coefficient, fig.height=4, fig.width=6, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
 
@@ -433,72 +465,39 @@ activity_calcs <- calcs_with_meta %>%
 
 
 ```
+# Save data to file 
 
-# Compare R vs. Excel results 
+```{r}
 
-I used the "HB_Hydrolygic enzyme calculation template_12 samples" in the Gutknecht shared drive to do the "Excel" calculations listed here. I had to a couple changes to the calculations so they aligned with my R script:
+# select plate name and final activity calculations 
+final_activity <- activity_calcs %>% 
+  select(plate, BG_activity, Cello_activity, NAG_activity, P_activity)
 
-**Emission coefficient**: In the Excel sheet, emission coefficient is calculated as the slope of the MUB standard curve.  German et al. 2011 specify that emission coefficient is this slope **divided by the assay volume**.  I changed the excel spreadsheet to account for this, and also removed the assay volume term from the **final activity calculation** so we weren't accounting for it twice.  The math would have worked out either way, but I wanted to be able to compare coefficients.
+# save a copy of the final data in the results sub-directory
+write.csv(final_activity, "./results/hydrolytic_mgtest_2020-07-03.csv", row.names = FALSE)
 
+# save a list of the "bad" wells you removed 
 
-```{r calc-compare, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
-
-#results from R calculations
-script_test <- activity_calcs %>% 
-  select(plate, BG_activity, P_activity, NAG_activity, Cello_activity)
-
-# Load in test results from excel spreadsheet calcs
-test1 <- read.csv("./mg_files/excel_test1_mg.csv", stringsAsFactors = FALSE)
-colnames(test1) <- c("plate", "BG_activity", "P_activity", "NAG_activity", "Cello_activity")
-
-#create columns to specify data provenance
-test1$batch = "excel"
-script_test$batch = "r_script"
-
-#convert to dataframe
-test1 <- as.data.frame(test1)
-script_test <- as.data.frame(script_test)
-
-#merge calcs from excel & R script into one dataframe
-merge_test <- rbind(test1, script_test)
-
-# bar plots to compare calcs
-cello_plot <- ggplot() + 
-  geom_col(data = merge_test, aes(x = plate, y = Cello_activity, group = batch, fill = batch), position = "dodge") + 
-  coord_flip() + 
-  labs(title = "Cello activity")
-
-bg_plot <- ggplot() + 
-  geom_col(data = merge_test, aes(x = plate, y = BG_activity, group = batch, fill = batch), position = "dodge") + 
-  coord_flip() + 
-  labs(title = "BG activity")
-
-nag_plot <- ggplot() + 
-  geom_col(data = merge_test, aes(x = plate, y = NAG_activity, group = batch, fill = batch), position = "dodge") + 
-  coord_flip() + 
-  labs(title = "NAG activity")
-
-p_plot <- ggplot() + 
-  geom_col(data = merge_test, aes(x = plate, y = P_activity, group = batch, fill = batch), position = "dodge") + 
-  coord_flip() + 
-  labs(title = "P activity")
-
-cello_plot
-bg_plot
-nag_plot
-p_plot
-
+write.csv(bad_list, "./results/bad_hydrolytic_mgtest_2020-07-03.csv", row.names = FALSE)
 ```
+
 
 # Visualizing variability 
 
-```{r variability}
+## MUB Standards (Plate B - Emission)
+
+```{r variability emis-var}
 # to visualize variability on plate B (emission) 
 plate_b_means %>% 
   ggplot() +
   geom_histogram(aes(cv), bins = 20) +
-  labs(title = "CV for Standard Curve Plate B (no soil)")
+  labs(title = "CV for Standard Curve Plate B MUB Standards (no soil - emission)")
+```
+\newpage
 
+## MUB + Soil Standards (Plate A- Quench)
+
+```{r quench-var}
 
 # quench std data 
 quench_var <- quench_nested %>% 
@@ -509,7 +508,7 @@ quench_var <- quench_nested %>%
 (quench_var_plot <- quench_var %>% 
   ggplot() + 
   geom_histogram(aes(cv, fill = plate), bins = 20) + 
-  labs(title = "CV distribution quench standards") + 
+  labs(title = "CV distribution MUB + Soil standards (quench)") + 
   facet_wrap(vars(plate)) + 
   theme(legend.position = "none"))
 
@@ -517,15 +516,19 @@ quench_var <- quench_nested %>%
 (quench_var_plot <- quench_var %>% 
   ggplot() + 
   geom_histogram(aes(cv), bins = 20) + 
-  labs(title = "CV distribution quench standards") + 
+  labs(title = "CV distribution MUB + soil standards (quench)") + 
   theme(legend.position = "none"))
+```
+\newpage
 
+## Assay Wells (Plate A)
+```{r assay-var}
 # to visualize the assay well variability by plate
 (assay_var_plot <- assay_sub_blnks %>% 
   filter(str_detect(id,"assay")) %>% 
   ggplot() + 
   geom_histogram(aes(cv, fill = plate), bins = 20) + 
-  labs(title = "CV distribution assay wells") +
+  labs(title = "CV distribution assay wells by plate") +
     facet_wrap(vars(plate)) + 
     theme(legend.position = "none"))
 
@@ -536,17 +539,22 @@ quench_var <- quench_nested %>%
   geom_histogram(aes(cv), bins = 30) + 
   labs(title = "CV distribution assay wells") +
     theme(legend.position = "none"))
+```
 
+\newpage
+## Substrate blank wells (Plate A)
+
+```{r sub-var} 
 # visualize the substrate blank variability by plate
 (subs_var_plot <- assay_sub_blnks %>% 
   filter(str_detect(id,"blank")) %>% 
   ggplot() + 
   geom_histogram(aes(cv, fill = plate), bins = 20) + 
-  labs(title = "CV distribution substrate controls") +
+  labs(title = "CV distribution substrate controls by plate") +
     facet_wrap(vars(plate)) + 
     theme(legend.position = "none"))
 
-# visualzie substrate blank variability overall
+# visualize substrate blank variability overall
 (subs_var_plot <- assay_sub_blnks %>% 
   filter(str_detect(id,"blank")) %>% 
   ggplot() + 
